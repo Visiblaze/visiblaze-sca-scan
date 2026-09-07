@@ -336,16 +336,22 @@ runs:
             -o "${WORK}/scanner-raw.json" "${IN_PATH}" \
             || bail error "the scanner failed"
 
-          # Its own metadata, read and reported. An expired database scans successfully and
-          # reports nothing, so its age is a fact about the result rather than trivia.
+          # Its own metadata, read, reported AND passed to normalize.
+          #
+          # An expired database scans successfully and reports nothing, so its age is a fact
+          # about the result rather than trivia. It travels into the payload because the
+          # payload's `complete` flag authorises Visiblaze to CLOSE findings it no longer
+          # sees — and a scan that assessed nothing must not be allowed to close anything.
+          # An empty value here is deliberate and meaningful: it tells normalize the age
+          # could not be established, which withdraws the claim just as a stale age does.
           DB_AGE_DAYS="$("${WORK}/visiblaze-sca" db-age --cache-dir "${HOME}/.cache/trivy" 2>/dev/null || echo "")"
           if [ -n "$DB_AGE_DAYS" ]; then
             echo "visiblaze-sca: the scanner's vulnerability database is ${DB_AGE_DAYS} day(s) old"
             if [ "$DB_AGE_DAYS" -gt 7 ] 2>/dev/null; then
-              echo "::warning::visiblaze-sca: the scanner's vulnerability database is ${DB_AGE_DAYS} days old. It will still report a clean result on packages whose advisories are newer than that."
+              echo "::warning::visiblaze-sca: the scanner's vulnerability database is ${DB_AGE_DAYS} days old. It will still report a clean result on packages whose advisories are newer than that, so this upload is marked INCOMPLETE and Visiblaze will not close existing findings from it."
             fi
           else
-            echo "::warning::visiblaze-sca: could not establish the scanner's database age. A database that is present but expired scans successfully and finds nothing, so an unverifiable age is worth knowing about."
+            echo "::warning::visiblaze-sca: could not establish the scanner's database age. A database that is present but expired scans successfully and finds nothing, so this upload is marked INCOMPLETE and Visiblaze will not close existing findings from it."
           fi
 
           "${WORK}/visiblaze-sca" normalize \
@@ -356,6 +362,7 @@ runs:
             --commit "${GH_SHA}" \
             --scanner "trivy" \
             --scanner-version "${TRIVY_VERSION}" \
+            --db-age-days "${DB_AGE_DAYS}" \
             --out "${WORK}/findings.json" \
             || bail error "could not normalise the scanner's output"
 
