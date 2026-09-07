@@ -1,0 +1,13 @@
+Visiblaze SCA scan
+Copyright 2026 Visiblaze
+
+This product includes software developed at Visiblaze (https://visiblaze.com).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+governing terms.
+
+This action downloads and executes third-party software on the runner. Each such
+dependency is pinned to an exact version and digest-verified before execution; see
+pins.env for the current pins and their provenance.
+
+  Trivy — https://github.com/aquasecurity/trivy — Apache-2.0

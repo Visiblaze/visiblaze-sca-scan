@@ -1,0 +1,413 @@
+# Copyright 2026 Visiblaze
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Visiblaze — find vulnerable dependencies
+#
+# ── What this does, and what leaves your network ──
+#
+# The scan runs on YOUR runner, against the checkout that is already there. Your source code is
+# never uploaded. What leaves depends on which mode you run, and the difference is the whole
+# point of this action:
+#
+#   inventory   the list of packages your manifests declare — name, version, ecosystem, and
+#               which manifest each came from. No source, no findings. We match it against our
+#               advisory corpus and decide what is vulnerable.
+#
+#   scanner     the findings a third-party scanner produced on your runner — package, version,
+#               advisory id, severity, fixed version. The verdict is reached on your machine.
+#
+#   both        runs each independently and uploads both. This is the comparison mode, and it
+#               exists because the two answer the same question by different means and we would
+#               rather show you the difference than pick for you.
+#
+# Neither mode uploads a lockfile. A lockfile is not source code, but it is a complete list of
+# what you build with, and you did not ask us to hold that.
+#
+# It reads. It does not write, comment, annotate, or open pull requests. The only thing it can
+# do to your pipeline is set an exit code, and only if you ask it to with `fail-on`.
+#
+# ── There is no secret to configure ──
+#
+# Authentication is GitHub's own OIDC. The workflow needs `permissions: id-token: write`, and
+# the action mints a token per upload that lives for minutes and states cryptographically which
+# repository produced it. Nothing is stored in your repository secrets, so there is nothing to
+# rotate, leak or revoke.
+#
+# The two modes use DIFFERENT audiences, and that is deliberate rather than tidy. An inventory
+# upload claims what your repository declares and leaves the verdict to us. A findings upload
+# claims the verdict itself. A token minted for the first cannot be replayed against the
+# second, so a compromised runner cannot assert findings it never produced.
+#
+# ── Every binary it runs is pinned and digest-verified ──
+#
+# This action downloads up to two executables onto your runner. Both are pinned to an exact
+# version in pins.env and both have their SHA-256 checked BEFORE execution; a mismatch aborts
+# and runs nothing. There is no "latest" anywhere, because a floating dependency inside a
+# pinned action would mean the SHA you pinned does not determine what runs on your machine.
+#
+# The one thing NOT pinned is the third-party scanner's vulnerability database, and it cannot
+# be: yesterday's database cannot know about today's advisory. See pins.env for what that
+# means, including the failure mode where an expired database scans successfully and finds
+# nothing — which this action reports rather than letting pass as clean.
+#
+# ── Composite, not Docker, on purpose ──
+#
+# A Docker action would mean trusting an image you cannot read. This is a shell script you can
+# review, running on your own runner. For a tool that reads your dependency manifests, readable
+# beats convenient.
+name: Visiblaze SCA
+description: Find vulnerable dependencies on your own runner. Your code never leaves your network — only the package list, or the findings, or both.
+author: Visiblaze
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  tenant:
+    description: Your Visiblaze tenant id. Required — uploads posted against the wrong tenant are not recoverable by re-running.
+    required: true
+  api-url:
+    description: >-
+      Your Visiblaze ingest endpoint. Required — we give you the exact URL when your
+      organisation is authorised, because it depends on which region your tenant lives in.
+    required: true
+  mode:
+    description: >-
+      inventory, scanner, or both. `inventory` sends your package list and lets Visiblaze match
+      it; `scanner` runs a third-party scanner here and sends its findings; `both` runs each
+      independently and uploads both so you can compare them. Default `inventory` — it is the
+      mode that sends least and applies our freshness and coverage checks to the result.
+    required: false
+    default: "inventory"
+  repo-key:
+    description: >-
+      The Visiblaze repository key, "github#<numeric repo id>". Defaults to the id of the
+      repository running the workflow, which is correct unless you are deliberately reporting on
+      behalf of another repository — and the server rejects that, so the default is what you want.
+    required: false
+    default: ""
+  path:
+    description: >-
+      Directory to scan, relative to the workspace. Defaults to the whole checkout. In a
+      monorepo, point one job per package at its own directory — the action then DECLARES the
+      manifests it read as its coverage, so several jobs on one repository stop resolving each
+      other's findings.
+    required: false
+    default: "."
+  fail-on:
+    description: >-
+      Fail the job when a finding at or above this severity is present: critical, high, medium
+      or low. Empty by default, and that default is deliberate — a repository with existing
+      dependency debt would otherwise be permanently red, and a check that can never go green is
+      one people route around. Findings are still reported when this is empty.
+    required: false
+    default: ""
+  fail-on-error:
+    description: >-
+      Fail the job if the scan or the upload itself fails. Default false: a scanner outage must
+      not be the reason a deploy pipeline goes red. Set true if you would rather know loudly.
+      This is independent of `fail-on`, which is about your dependencies rather than about this
+      tool.
+    required: false
+    default: "false"
+  dry-run:
+    description: Scan and print what would be sent, upload nothing. Use this for the first run so you can read exactly what leaves.
+    required: false
+    default: "false"
+
+outputs:
+  packages:
+    description: Number of packages resolved from your manifests (inventory mode).
+    value: ${{ steps.scan.outputs.packages }}
+  findings:
+    description: Number of findings the third-party scanner reported (scanner mode).
+    value: ${{ steps.scan.outputs.findings }}
+  status:
+    description: One of sent, dry-run, failed, partial.
+    value: ${{ steps.scan.outputs.status }}
+  policy:
+    description: One of pass, fail, not-applied — whether `fail-on` was met.
+    value: ${{ steps.scan.outputs.policy }}
+  database-age-days:
+    description: >-
+      Age in days of the third-party scanner's vulnerability database (scanner mode). Reported
+      because an expired database scans successfully and finds nothing.
+    value: ${{ steps.scan.outputs.database_age_days }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        VISIBLAZE_TENANT: ${{ inputs.tenant }}
+        VISIBLAZE_API: ${{ inputs.api-url }}
+        IN_MODE: ${{ inputs.mode }}
+        IN_REPO_KEY: ${{ inputs.repo-key }}
+        IN_PATH: ${{ inputs.path }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        GH_REPO_ID: ${{ github.event.repository.id }}
+        GH_REPOSITORY: ${{ github.repository }}
+        GH_SHA: ${{ github.sha }}
+        # github.ref_name is "5/merge" on a pull_request event — a synthetic ref for a commit
+        # that exists only on GitHub's side. The stored inventory is keyed on the ref, so
+        # uploading that would create a phantom branch alongside the real one and neither
+        # would reconcile the other. head_ref is the actual source branch and is set only on
+        # pull_request events, so this resolves to the real branch in both cases.
+        GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+
+        # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
+        # rather than buried in a trailing `|| true`.
+        bail() {
+          local level="$1"; shift
+          echo "::${level}::visiblaze-sca: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          if [ "${FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
+          exit 0
+        }
+
+        case "${IN_MODE}" in
+          inventory|scanner|both) ;;
+          *) bail error "mode must be inventory, scanner or both; got '${IN_MODE}'" ;;
+        esac
+
+        # ── The pin, and the refusal to run without it ────────────────────────────────────
+        PINS="${ACTION_DIR}/pins.env"
+        [ -f "$PINS" ] || bail error "pins.env is missing from the action directory — refusing to download anything unpinned"
+        set -a
+        # shellcheck disable=SC1090
+        . "$PINS"
+        set +a
+
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH=amd64 ;;
+          aarch64|arm64) ARCH=arm64 ;;
+          *) bail error "unsupported runner architecture $(uname -m); Visiblaze SCA publishes linux/amd64 and linux/arm64" ;;
+        esac
+        if [ "$(uname -s)" != "Linux" ]; then
+          bail error "unsupported runner OS $(uname -s); Visiblaze SCA publishes Linux builds only"
+        fi
+
+        # Fails closed on an unpopulated pin. This is what makes it impossible to run this
+        # action with an unverified dependency: the sentinel is the committed default, so the
+        # action is inert until somebody deliberately fills it in.
+        [ "${SCANNER_VERSION}" != "UNSET" ] || bail error "SCANNER_VERSION is UNSET in pins.env — this action has not been released yet"
+
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "$WORK"' EXIT
+
+        verify_sha() {
+          local file="$1" want="$2" what="$3"
+          local got
+          got="$(sha256sum "$file" | cut -d' ' -f1)"
+          if [ "$got" != "$want" ]; then
+            bail error "$what digest mismatch — expected $want, got $got. Refusing to execute it."
+          fi
+        }
+
+        # ── Our own binary: one digest, published by us alongside the release ─────────────
+        # The expected digest comes from pins.env, which is committed, NOT from a checksums
+        # file fetched beside the binary. Fetching both from the same release verifies only
+        # that the download was not corrupted in transit — anyone able to swap the asset can
+        # swap the checksum next to it. Trivy is pinned the same way, below.
+        case "$ARCH" in
+          amd64) SCANNER_SHA="${SCANNER_SHA256_LINUX_AMD64}" ;;
+          arm64) SCANNER_SHA="${SCANNER_SHA256_LINUX_ARM64}" ;;
+        esac
+        [ "${SCANNER_SHA:-UNSET}" != "UNSET" ] || bail error "the Visiblaze scanner digest for linux/${ARCH} is UNSET in pins.env — refusing to execute an unverified binary"
+
+        SCANNER_URL="${SCANNER_RELEASE_BASE}/${SCANNER_VERSION}/visiblaze-sca_linux_${ARCH}"
+        curl -fsSL --retry 3 --retry-delay 2 -o "${WORK}/visiblaze-sca" "$SCANNER_URL" \
+          || bail error "could not download the Visiblaze scanner from ${SCANNER_URL}"
+        verify_sha "${WORK}/visiblaze-sca" "$SCANNER_SHA" "Visiblaze scanner"
+        chmod +x "${WORK}/visiblaze-sca"
+
+        REPO_KEY="${IN_REPO_KEY}"
+        [ -n "$REPO_KEY" ] || REPO_KEY="github#${GH_REPO_ID}"
+
+        PACKAGES=0
+        FINDINGS=0
+        DB_AGE_DAYS=""
+        SENT_ANY=false
+        FAILED_ANY=false
+
+        # ── OIDC, minted per upload ───────────────────────────────────────────────────────
+        #
+        # A token per audience rather than one shared token, because the two audiences exist
+        # precisely so that one upload's credential cannot perform the other's upload.
+        mint_token() {
+          local audience="$1"
+          [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || return 1
+          curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p'
+        }
+
+        upload() {
+          local route="$1" audience="$2" payload="$3" what="$4"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "── ${what}: this is exactly what would be sent to ${route} ──"
+            # Printed in full rather than summarised. A customer deciding whether to trust
+            # this action needs to read the payload, not a description of it.
+            cat "$payload"
+            echo
+            return 0
+          fi
+          local token
+          token="$(mint_token "$audience")" || { echo "::error::visiblaze-sca: no OIDC token available — does the job have 'permissions: id-token: write'?"; return 1; }
+          [ -n "$token" ] || { echo "::error::visiblaze-sca: OIDC token request returned nothing"; return 1; }
+
+          # The tenant is CLAIMED here and checked server-side against an admin-created
+          # binding for the repository that minted the token. Both halves are necessary: the
+          # claim alone would let anyone name a tenant, and the token alone identifies a
+          # repository without saying which tenant may receive its data. An upload with no
+          # claimed tenant is rejected outright, which is why this header is not optional.
+          local code
+          code="$(curl -sS -o "${WORK}/resp.json" -w '%{http_code}' \
+            -X POST "${VISIBLAZE_API}${route}" \
+            -H "Authorization: Bearer ${token}" \
+            -H "x-visiblaze-tenant: ${VISIBLAZE_TENANT}" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@${payload}")"
+          case "$code" in
+            2*) echo "visiblaze-sca: ${what} accepted (HTTP ${code})"; return 0 ;;
+            401) echo "::error::visiblaze-sca: ${what} rejected (401) — the token was not accepted for tenant '${VISIBLAZE_TENANT}'. Check the tenant id, and that your Visiblaze admin has bound this repository or organisation to it."; return 1 ;;
+            403) echo "::error::visiblaze-sca: ${what} refused (403) — your organisation is not authorised for this route yet. Ask your Visiblaze admin."; return 1 ;;
+            *)  echo "::error::visiblaze-sca: ${what} failed (HTTP ${code}): $(head -c 400 "${WORK}/resp.json")"; return 1 ;;
+          esac
+        }
+
+        # ── Architecture B: inventory ─────────────────────────────────────────────────────
+        if [ "${IN_MODE}" = "inventory" ] || [ "${IN_MODE}" = "both" ]; then
+          "${WORK}/visiblaze-sca" inventory \
+            --path "${IN_PATH}" \
+            --repo-key "${REPO_KEY}" \
+            --repo-name "${GH_REPOSITORY}" \
+            --ref "${GH_REF_NAME}" \
+            --commit "${GH_SHA}" \
+            --out "${WORK}/inventory.json" \
+            || bail error "inventory collection failed"
+
+          PACKAGES="$("${WORK}/visiblaze-sca" count --field packages --in "${WORK}/inventory.json" 2>/dev/null || echo 0)"
+          echo "visiblaze-sca: resolved ${PACKAGES} packages from your manifests"
+
+          if upload "/v1/code/sca/inventory" "visiblaze-sca-inventory" "${WORK}/inventory.json" "inventory"; then
+            SENT_ANY=true
+          else
+            FAILED_ANY=true
+          fi
+        fi
+
+        # ── Architecture A: third-party scanner ───────────────────────────────────────────
+        if [ "${IN_MODE}" = "scanner" ] || [ "${IN_MODE}" = "both" ]; then
+          [ "${TRIVY_VERSION}" != "UNSET" ] || bail error "TRIVY_VERSION is UNSET in pins.env — scanner mode has no pinned scanner to run"
+          case "$ARCH" in
+            amd64) TRIVY_URL="${TRIVY_URL_LINUX_AMD64}"; TRIVY_SHA="${TRIVY_SHA256_LINUX_AMD64}" ;;
+            arm64) TRIVY_URL="${TRIVY_URL_LINUX_ARM64}"; TRIVY_SHA="${TRIVY_SHA256_LINUX_ARM64}" ;;
+          esac
+          [ "$TRIVY_SHA" != "UNSET" ] || bail error "the Trivy digest for linux/${ARCH} is UNSET in pins.env — refusing to execute an unverified binary"
+
+          curl -fsSL --retry 3 --retry-delay 2 -o "${WORK}/trivy.tar.gz" "$TRIVY_URL" \
+            || bail error "could not download the scanner from ${TRIVY_URL}"
+          verify_sha "${WORK}/trivy.tar.gz" "$TRIVY_SHA" "scanner archive"
+          tar -xzf "${WORK}/trivy.tar.gz" -C "${WORK}" trivy || bail error "could not extract the scanner archive"
+          chmod +x "${WORK}/trivy"
+
+          # The database is downloaded here, on your runner, and is ~1.27 GiB. It is not
+          # pinned, and cannot be — see pins.env.
+          "${WORK}/trivy" fs --scanners vuln --format json --quiet \
+            -o "${WORK}/scanner-raw.json" "${IN_PATH}" \
+            || bail error "the scanner failed"
+
+          # Its own metadata, read and reported. An expired database scans successfully and
+          # reports nothing, so its age is a fact about the result rather than trivia.
+          DB_AGE_DAYS="$("${WORK}/visiblaze-sca" db-age --cache-dir "${HOME}/.cache/trivy" 2>/dev/null || echo "")"
+          if [ -n "$DB_AGE_DAYS" ]; then
+            echo "visiblaze-sca: the scanner's vulnerability database is ${DB_AGE_DAYS} day(s) old"
+            if [ "$DB_AGE_DAYS" -gt 7 ] 2>/dev/null; then
+              echo "::warning::visiblaze-sca: the scanner's vulnerability database is ${DB_AGE_DAYS} days old. It will still report a clean result on packages whose advisories are newer than that."
+            fi
+          else
+            echo "::warning::visiblaze-sca: could not establish the scanner's database age. A database that is present but expired scans successfully and finds nothing, so an unverifiable age is worth knowing about."
+          fi
+
+          "${WORK}/visiblaze-sca" normalize \
+            --in "${WORK}/scanner-raw.json" \
+            --repo-key "${REPO_KEY}" \
+            --repo-name "${GH_REPOSITORY}" \
+            --ref "${GH_REF_NAME}" \
+            --commit "${GH_SHA}" \
+            --scanner "trivy" \
+            --scanner-version "${TRIVY_VERSION}" \
+            --out "${WORK}/findings.json" \
+            || bail error "could not normalise the scanner's output"
+
+          FINDINGS="$("${WORK}/visiblaze-sca" count --field findings --in "${WORK}/findings.json" 2>/dev/null || echo 0)"
+          echo "visiblaze-sca: the scanner reported ${FINDINGS} findings"
+
+          if upload "/v1/code/sca/findings" "visiblaze-sca-findings" "${WORK}/findings.json" "findings"; then
+            SENT_ANY=true
+          else
+            FAILED_ANY=true
+          fi
+        fi
+
+        # ── Outputs, and the policy gate ──────────────────────────────────────────────────
+        {
+          echo "packages=${PACKAGES}"
+          echo "findings=${FINDINGS}"
+          echo "database_age_days=${DB_AGE_DAYS}"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "${DRY_RUN}" = "true" ]; then
+          echo "status=dry-run" >> "$GITHUB_OUTPUT"
+        elif [ "$FAILED_ANY" = "true" ] && [ "$SENT_ANY" = "true" ]; then
+          # `both` where one half landed. Named rather than folded into failure: the half that
+          # arrived is real and stored, and reporting the whole run as failed would invite a
+          # re-run that duplicates it.
+          echo "status=partial" >> "$GITHUB_OUTPUT"
+        elif [ "$FAILED_ANY" = "true" ]; then
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          if [ "${FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
+        else
+          echo "status=sent" >> "$GITHUB_OUTPUT"
+        fi
+
+        # ── fail-on ───────────────────────────────────────────────────────────────────────
+        #
+        # Evaluated ONLY against what this runner decided for itself — the third-party
+        # scanner's findings. Inventory mode cannot gate a build, and pretending otherwise
+        # would be the worst kind of wrong: the verdict for an inventory upload is reached on
+        # our side, after this job has already finished, so a gate here would either block on
+        # nothing or block on a stale answer.
+        if [ -z "${IN_FAIL_ON}" ]; then
+          echo "policy=not-applied" >> "$GITHUB_OUTPUT"
+        elif [ "${IN_MODE}" = "inventory" ]; then
+          echo "::warning::visiblaze-sca: fail-on is set but mode is 'inventory', where the verdict is reached after this job ends. No gate was applied. Use mode 'scanner' or 'both' to gate a build."
+          echo "policy=not-applied" >> "$GITHUB_OUTPUT"
+        else
+          if "${WORK}/visiblaze-sca" gate --in "${WORK}/findings.json" --at-or-above "${IN_FAIL_ON}"; then
+            echo "policy=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "policy=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::visiblaze-sca: findings at or above '${IN_FAIL_ON}' are present"
+            exit 1
+          fi
+        fi
