@@ -196,6 +196,27 @@ runs:
         . "$PINS"
         set +a
 
+        # ── Where this may send data ────────────────────────────────────────────────────
+        #
+        # Checked here, in readable shell, before anything is downloaded or scanned. `api-url` is
+        # a workflow input, so it is editable by anyone who can edit the workflow — including in a
+        # pull request. Without this check a modified value would send this job's OIDC token and
+        # the dependency inventory to a host of the editor's choosing, and the step would still
+        # succeed. The allowlist lives in pins.env so it is fixed at the SHA a customer pinned.
+        case "$VISIBLAZE_API" in
+          https://*) ;;
+          *) bail error "api-url must be https, got '${VISIBLAZE_API}'" ;;
+        esac
+        API_ORIGIN="$(printf '%s' "$VISIBLAZE_API" | awk -F/ '{print $1"//"$3}')"
+        # Distinguished from "your origin is not listed" because the fix differs, and because an
+        # unquoted multi-value ALLOWED_API_ORIGINS produces exactly this state (see pins.env).
+        [ -n "${ALLOWED_API_ORIGINS:-}" ] || bail error "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
+        API_OK=""
+        for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
+          if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
+        done
+        [ -n "$API_OK" ] || bail error "api-url origin ${API_ORIGIN} is not one this action permits — data may only be sent to a Visiblaze endpoint listed in pins.env"
+
         case "$(uname -m)" in
           x86_64|amd64) ARCH=amd64 ;;
           aarch64|arm64) ARCH=arm64 ;;
